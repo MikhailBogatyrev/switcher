@@ -1,0 +1,18 @@
+# Сборка
+build.noindex/
+Switcher.app/
+switcher
+make-icon
+
+# Личные данные пользователя. В репозитории им делать нечего: выученные слова, журнал
+# починок и пошаговая запись — это набранный человеком текст. Живут они в
+# ~/Library/Application Support/switcher/, но правило на месте на случай,
+# если кто-то скопирует их в папку проекта, разбирая проблему.
+*.log
+learned.json
+log.json
+trace.log
+startup.log
+
+# macOS
+.DS_Store
