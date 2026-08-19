@@ -129,32 +129,100 @@ func evaluate(word: String, layouts: [Layout]) -> (fixed: String, to: Layout)? {
 
 /// Стирает набранное слово и печатает исправленное вместе с разделителем.
 /// Разделитель мы перехватили и до экрана не пустили, поэтому стираем ровно слово.
+private func ms(_ from: Date, _ to: Date) -> Int { Int(to.timeIntervalSince(from) * 1000) }
+
 private func applyFix(word: String, separator: Character, fixed: String, to layout: Layout) {
-    trackingSuppressed = true
+    let started = Date()
+    defer { trace("правка «\(word)» заняла \(Int(Date().timeIntervalSince(started) * 1000)) мс") }
+    let echo = fixed + String(separator)
+    expectEcho(backspaces: word.count, text: echo)
+    // Слово завершено разделителем — новое начинается с чистого листа. Чистим сразу:
+    // отложенная чистка стирала бы первые буквы следующего слова.
+    buffer = ""
     for _ in 0..<word.count { postMarked(keyBackspace) }
-    typeText(fixed + String(separator))
+    let erased = Date()
+    typeText(echo)
+    armEchoDeadline()
+    let typed = Date()
     switchInputSource(to: layout)
+    trace("шаги: ⌫ \(ms(started, erased)) мс, печать \(ms(erased, typed)) мс, раскладка \(ms(typed, Date())) мс")
     lastFix = (word, fixed)
     announce(before: word, after: fixed, auto: true)
-    // Слово завершено разделителем — новое начинается с чистого листа.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-        buffer = ""
-        trackingSuppressed = false
-    }
 }
 
 /// Возвращает true, если событие надо проглотить (мы введём его сами, уже после правки).
 private var seenKeys = 0
 
+// MARK: - Эхо собственной печати
+//
+// Свои backspace и символы возвращаются в тап и без метки: она переживает прогон не всегда.
+// Раньше на это отвечали глухим таймаутом — 120 мс не копить вообще ничего. Ценой был
+// пропуск начала следующего слова: пауза между разделителем и первой буквой у беглого
+// набора как раз около сотни миллисекунд, так что «yfit» доезжало до проверки как «fit»,
+// а это настоящее английское слово — и починка молча не срабатывала.
+//
+// Поэтому гасим не время, а ровно то, что напечатали сами: список ожидаемых событий в том
+// порядке, в каком мы их отправили. Совпало с началом списка — наше, вычёркиваем; не
+// совпало — ввод пользователя, копим как обычно.
+
+private enum Echo {
+    case key(CGKeyCode)      // наш backspace
+    case char(Character)     // наш напечатанный символ
+}
+
+private var expectedEcho: [Echo] = []
+private var echoDeadline = Date.distantPast
+
+/// Объявляет, что мы сейчас напечатаем. Вызывать до отправки событий.
+func expectEcho(backspaces: Int, text: String) {
+    expectedEcho = Array(repeating: Echo.key(keyBackspace), count: backspaces) + text.map { Echo.char($0) }
+    // Пока события не отправлены, ожиданию истекать не с чего: отсчёт начнётся в armEchoDeadline().
+    // Отсчитывать отсюда — та же ошибка, что и раньше: срок истекал ещё до того, как эхо
+    // возвращалось, все наши символы принимались за ввод пользователя и оседали в буфере.
+    echoDeadline = .distantFuture
+}
+
+/// Запускает отсчёт: всё отправлено, дальше эхо либо придёт, либо мы перестанем его ждать.
+/// Страховка нужна, иначе список однажды съест настоящий ⌫ пользователя.
+///
+/// Отсчёт заводим не здесь, а когда главный поток вернётся в run loop. Иначе любая долгая
+/// работа сразу после отправки съедает срок целиком — ровно так и вышло со звуком починки.
+func armEchoDeadline() {
+    guard !expectedEcho.isEmpty else { return }
+    DispatchQueue.main.async {
+        guard !expectedEcho.isEmpty else { return }
+        echoDeadline = Date().addingTimeInterval(0.6)
+    }
+}
+
+/// true — событие наше собственное; в буфер оно не идёт, до приложения доходит как обычно.
+private func consumeEcho(_ event: CGEvent) -> Bool {
+    guard let head = expectedEcho.first else { return false }
+    guard Date() <= echoDeadline else {
+        trace("эхо: не дождался \(expectedEcho.count) событий — сбрасываю ожидание")
+        expectedEcho.removeAll()
+        return false
+    }
+
+    switch head {
+    case .key(let expected):
+        guard CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)) == expected else { return false }
+    case .char(let expected):
+        var length = 0
+        var chars = [UniChar](repeating: 0, count: 8)
+        event.keyboardGetUnicodeString(maxStringLength: 8, actualStringLength: &length,
+                                       unicodeString: &chars)
+        guard length >= 1, let scalar = Unicode.Scalar(chars[0]),
+              Character(scalar) == expected else { return false }
+    }
+    expectedEcho.removeFirst()
+    return true
+}
+
 /// Последнее набранное слово — им пользуется и ручной хоткей: копировать выделение через
 /// ⌘C во многих приложениях (браузеры, Electron) не выходит, а следить за клавиатурой — всегда.
 func currentTypedWord() -> String { buffer }
 func setTypedBuffer(_ text: String) { buffer = text }
-
-/// Пока мы сами впечатываем правку (backspace + печать), слежение надо глушить целиком.
-/// Пометка «свой» на событиях не всегда переживает прогон через тап, и без этого флага
-/// наши же backspace съедали слово из буфера — перебивка срабатывала ровно один раз.
-var trackingSuppressed = false
 
 private func handleKeyDown(_ event: CGEvent) -> Bool {
     // Фокус в поле пароля: система включает Secure Input. Ничего не копим и не помним.
@@ -162,7 +230,8 @@ private func handleKeyDown(_ event: CGEvent) -> Bool {
         buffer = ""
         return false
     }
-    if trackingSuppressed { return false }
+    // Наша собственная печать (метку потеряла по дороге) — мимо буфера, но в приложение.
+    if consumeEcho(event) { return false }
 
     let flags = event.flags
     // Клавиши с ⌥ (в т.ч. сам хоткей ⌥/) — не набор текста. Буфер НЕ трогаем: он нужен хоткею.
@@ -189,6 +258,9 @@ private func handleKeyDown(_ event: CGEvent) -> Bool {
 
     // Слово копим всегда — даже с выключенным автоматом, ради ручного хоткея.
     if isWordCharacter(character, layouts: activeLayouts(from: autoLayouts)) {
+        if !expectedEcho.isEmpty {
+            trace("ввод «\(character)» пришёл посреди нашей печати (ждём ещё \(expectedEcho.count))")
+        }
         buffer.append(character)
         if buffer.count > 40 { buffer.removeFirst() }   // страховка от разрастания
         return false
@@ -219,6 +291,9 @@ private func handleKeyDown(_ event: CGEvent) -> Bool {
 private let tapCallback: CGEventTapCallBack = { _, type, event, _ in
     // Свои же события пропускаем мимо — иначе автозамена зациклится сама на себе.
     if event.getIntegerValueField(.eventSourceUserData) == selfMarker {
+        // Вычёркиваем их из ожидаемого эха здесь же: иначе список доживёт до таймаута
+        // и успеет принять за своё что-нибудь из настоящего ввода.
+        if type == .keyDown { _ = consumeEcho(event) }
         return Unmanaged.passUnretained(event)
     }
     switch type {

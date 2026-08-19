@@ -248,18 +248,21 @@ func toggleKeyboardLayout(_ layouts: [Layout]) {
     trace("перебивать нечего — просто переключил раскладку на \(next.name)")
 }
 
-func switchInputSource(to layout: Layout) {
-    // TISSelectInputSource нередко игнорируется с первого раза, если дёрнуть его сразу
-    // после вставки. Повторяем и проверяем, что раскладка действительно сменилась.
-    for attempt in 0..<3 {
-        TISSelectInputSource(layout.source)
-        usleep(30_000)
-        if let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-           let idRef = TISGetInputSourceProperty(current, kTISPropertyInputSourceID) {
-            let id = Unmanaged<CFString>.fromOpaque(idRef).takeUnretainedValue() as String
-            if id == layout.id { return }
-        }
+/// TISSelectInputSource нередко игнорируется с первого раза, если дёрнуть его сразу
+/// после вставки, поэтому переключение приходится проверять и повторять.
+///
+/// Ждать между попытками через usleep нельзя: перехватчик клавиатуры сидит на главном
+/// run loop, и пока мы спим прямо в нём, тап не обслуживается — система его отключает,
+/// а набранные в этот момент клавиши до нас не доходят. Отсюда и брались пропавшие буквы
+/// и слова, мимо которых починка проходила молча. Поэтому паузы — асинхронные:
+/// главный поток между попытками возвращается в run loop и продолжает разбирать ввод.
+func switchInputSource(to layout: Layout, attempt: Int = 0) {
+    TISSelectInputSource(layout.source)
+    guard attempt < 2 else { return }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+        if currentLayoutID() == layout.id { return }
         trace("переключение раскладки не подтвердилось (попытка \(attempt + 1))")
+        switchInputSource(to: layout, attempt: attempt + 1)
     }
 }
 
@@ -341,14 +344,12 @@ private func paste(_ text: String) {
 /// ложился новый текст, отсюда дубли вроде «exampleexample». Прямая печать этого лишена;
 /// выделение перед ней снимаем Delete, чтобы не зависеть от того, заменит его ввод или нет.
 private func replaceSelection(with text: String) {
-    trackingSuppressed = true
+    expectEcho(backspaces: 1, text: text)
+    buffer = ""
     postMarked(keyBackspace)   // один backspace удаляет всё выделение целиком
     usleep(20_000)
     typeText(text)
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-        buffer = ""
-        trackingSuppressed = false
-    }
+    armEchoDeadline()
 }
 
 /// Решает, надо ли трогать раскладку, по выбранному правилу.
@@ -503,16 +504,13 @@ private func applyManualFix(text: String, viaSelection: Bool, layouts: [Layout])
     if viaSelection {
         replaceSelection(with: fixed)
     } else {
-        // Глушим слежение на время своей печати и записываем результат уже после того,
-        // как синтетические backspace/символы отработают — иначе они сами съедят буфер.
-        trackingSuppressed = true
+        // Гасим ровно своё эхо, иначе синтетические backspace/символы съедят буфер.
+        expectEcho(backspaces: text.count, text: fixed)
+        setTypedBuffer(fixed)          // повторное нажатие вернёт обратно — toggle
         for _ in 0..<text.count { postMarked(keyBackspace) }
         usleep(15_000)
         typeText(fixed)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-            setTypedBuffer(fixed)      // повторное нажатие вернёт обратно — toggle
-            trackingSuppressed = false
-        }
+        armEchoDeadline()
     }
     switchInputSource(to: to)
     learnFromManualFix(before: text, after: fixed, from: from, to: to)

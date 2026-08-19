@@ -114,12 +114,30 @@ func prepareNotifications() {
     UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
 }
 
+/// Звук починки. Держим один загруженный экземпляр и играем его вне главного потока.
+///
+/// NSSound.play() на «холодном» аудиоустройстве блокирует поток, пока оно просыпается:
+/// замер на этой машине — 579 мс против 0 мс на «тёплом». Раньше звук играли прямо в
+/// главном потоке, внутри правки, а на нём же сидит перехватчик клавиатуры. Пока поток
+/// спал, тап не обслуживался: набранные в эту паузу буквы пропадали, а наше собственное
+/// эхо возвращалось уже просроченным и оседало в буфере как пользовательский ввод.
+private let feedbackQueue = DispatchQueue(label: "switcher.feedback", qos: .utility)
+private let tink = NSSound(named: .init("Tink"))
+
+private func playFixSound() {
+    feedbackQueue.async {
+        guard let sound = tink else { return }
+        if sound.isPlaying { sound.stop() }   // подряд идущие починки не глушат друг друга
+        sound.play()
+    }
+}
+
 /// Сообщает пользователю о починке ровно теми способами, которые он включил.
 func announce(before: String, after: String, auto: Bool) {
     ConversionLog.shared.add(before: before, after: after, auto: auto)
     recordFix(from: before, to: after)
 
-    if Settings.shared.playSound { NSSound(named: .init("Tink"))?.play() }
+    if Settings.shared.playSound { playFixSound() }
 
     guard Settings.shared.showNotifications else { return }
     prepareNotifications()
