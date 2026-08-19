@@ -435,7 +435,9 @@ func fixSelection(layouts allLayouts: [Layout]) {
         let fixed = convert(selected, from: from, to: to)
         guard fixed != selected else { toggleKeyboardLayout(layouts); return }
         replaceSelection(with: fixed)
-        switchInputSource(to: to)
+        if shouldSwitchLayout(before: selected, after: fixed, layouts: layouts) {
+            switchInputSource(to: to)
+        }
         learnFromManualFix(before: selected, after: fixed, from: from, to: to)
         announce(before: selected, after: fixed, auto: false)
         return
@@ -485,7 +487,9 @@ func fixSelection(layouts allLayouts: [Layout]) {
     replaceSelection(with: repaired)
     if let (from, to) = guessDirection(grabbed, layouts: layouts) {
         learnFromManualFix(before: grabbed, after: repaired, from: from, to: to)
-        switchInputSource(to: to)
+        if shouldSwitchLayout(before: grabbed, after: repaired, layouts: layouts) {
+            switchInputSource(to: to)
+        }
     }
     announce(before: grabbed, after: repaired, auto: false)
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { restorePasteboard(snapshot2) }
@@ -512,7 +516,9 @@ private func applyManualFix(text: String, viaSelection: Bool, layouts: [Layout])
         typeText(fixed)
         armEchoDeadline()
     }
-    switchInputSource(to: to)
+    if shouldSwitchLayout(before: text, after: fixed, layouts: layouts) {
+        switchInputSource(to: to)
+    }
     learnFromManualFix(before: text, after: fixed, from: from, to: to)
     announce(before: text, after: fixed, auto: false)
 }
@@ -657,7 +663,7 @@ if args.first == "--forget-all" {
 
 if args.first == "--check" {
     for word in args.dropFirst() {
-        if let (fixed, target) = evaluate(word: word, layouts: layouts) {
+        if case .fix(let fixed, let target) = evaluate(word: word, layouts: layouts) {
             print("\(word) -> \(fixed)   [\(target.name)]")
         } else {
             print("\(word) -> без изменений")

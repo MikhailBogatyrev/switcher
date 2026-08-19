@@ -12,6 +12,19 @@ private var autoLayouts: [Layout] = []
 var buffer = ""
 private var lastFix: (typed: String, fixed: String)?
 
+/// Номер «поколения» ввода. Растёт всякий раз, когда набранное слово перестаёт быть нашим:
+/// Enter, стрелки, щелчок мышью, аккорд с ⌘, снятый системой тап.
+///
+/// Нужен догоняющей правке. Она приходит на десятки миллисекунд позже разделителя, и за это
+/// время человек успевает нажать Enter — сообщение уже отправлено, а наши ⌫ прилетают в
+/// пустое поле и стирают что попало. Правка сверяет поколение и молча отменяется, если оно
+/// сменилось. Обещание «по Enter починки нет» держится именно здесь.
+private var inputEpoch = 0
+private func invalidateWord() {
+    buffer = ""
+    inputEpoch &+= 1
+}
+
 
 /// Клавиши, после которых текущее слово теряет смысл: стрелки, Enter, Tab, Esc.
 private let resetKeys: Set<Int64> = [123, 124, 125, 126, 36, 76, 48, 53, 115, 116, 119, 121]
@@ -44,19 +57,28 @@ func dictionaryLanguage(for layout: Layout) -> String? {
 /// нормальный текст мусором, поэтому такие строки словом не считаем вовсе.
 private var spellCache: [String: Bool] = [:]
 
-func isRealWord(_ word: String, language: String) -> Bool {
+/// Ответ словаря, если он известен без обращения к системе: nil — «не спрашивали».
+///
+/// Разделение не косметическое. Первый запрос про незнакомое слово читает словарь с диска и
+/// занимает десятки миллисекунд, а колбэк перехвата обязан возвращаться мгновенно: пока он
+/// думает, система вправе снять тап, и все клавиши этого окна теряются вместе с ним —
+/// снаружи это выглядит как «целый кусок фразы не перебился, а через минуту всё снова
+/// работает». Поэтому в колбэке спрашиваем только кеш, а промах уводим на главный поток.
+func cachedRealWord(_ word: String, language: String) -> Bool? {
     guard !word.isEmpty, word.allSatisfy({ $0.isLetter }) else { return false }
     // Выученное у пользователя весомее словаря: это его собственное решение.
     if LearnedWords.shared.contains(word, language: language) { return true }
+    return spellCache[language + ":" + word]
+}
 
-    let key = language + ":" + word
-    if let known = spellCache[key] { return known }
+func isRealWord(_ word: String, language: String) -> Bool {
+    if let known = cachedRealWord(word, language: language) { return known }
     let range = NSSpellChecker.shared.checkSpelling(
         of: word, startingAt: 0, language: language,
         wrap: false, inSpellDocumentWithTag: 0, wordCount: nil)
     let result = range.location == NSNotFound
     if spellCache.count > 5000 { spellCache.removeAll() }
-    spellCache[key] = result
+    spellCache[language + ":" + word] = result
     return result
 }
 
@@ -81,70 +103,122 @@ func looksLikeAddress(_ text: String) -> Bool {
     }
 }
 
-/// Частотные слова в одну-две буквы. Для них системный словарь не судья: он одинаково
-/// признаёт и «не», и «фу», и «иг», и «дн», поэтому по словарю коротким словом оказывается
-/// почти любая пара букв. Здесь — только те, ради которых правило и вводилось.
-private let commonShortWords: [String: Set<String>] = [
-    "ru": ["я", "в", "к", "с", "у", "о", "а", "и",
-           "не", "но", "по", "за", "на", "от", "до", "то", "из", "об", "во", "со", "ко",
-           "он", "мы", "вы", "ты", "их", "её", "ее", "ей", "им", "ну", "же", "ли", "бы",
-           "уж", "да", "уже", "их"],
+/// Словарь исключений для слов в один-два символа.
+///
+/// Системный словарь на такой длине не судья ни с одной стороны. Он одинаково «узнаёт»
+/// и «не», и «фу», и «иг», и «дн», а заодно считает английским словом «bp» — из-за чего
+/// «из» не чинилось никогда: проверка «слово нормально читается как есть» срабатывала
+/// раньше всех остальных. Поэтому короткие слова со словарём вообще не сверяются, только
+/// с этими списками, и решение читается в одну строку: набранное — слово своего языка
+/// (не трогаем), перебитое — слово чужого (чиним). Одновременно в обоих списках короткое
+/// слово не встречается, в этом вся идея.
+let shortWordExceptions: [String: Set<String>] = [
+    "ru": ["а", "в", "и", "к", "о", "с", "у", "я",
+           "аж", "ах", "бы", "во", "вы", "да", "до", "ее", "её", "ей", "ею", "же", "за",
+           "из", "им", "их", "ко", "ли", "мы", "на", "не", "ни", "но", "ну", "об", "он",
+           "от", "ох", "по", "со", "та", "те", "то", "ту", "ты", "уж", "ум", "эй", "эх"],
     "en": ["a", "i",
-           "am", "an", "as", "at", "be", "by", "do", "go", "he", "hi", "if", "in", "is",
-           "it", "me", "my", "no", "of", "on", "or", "so", "to", "up", "us", "we", "ok"],
+           "ad", "ah", "am", "an", "as", "at", "ax", "be", "by", "do", "ex", "go", "he",
+           "hi", "id", "if", "in", "is", "it", "la", "lo", "me", "my", "no", "of", "oh",
+           "ok", "on", "or", "ox", "pi", "pm", "re", "so", "ta", "to", "um", "up", "us",
+           "we"],
 ]
 
+/// Приговор слову. Третий случай — не лень, а следствие устройства перехвата: ответ знает
+/// только системный словарь, а спрашивать его в колбэке тапа нельзя (см. cachedRealWord).
+enum Verdict {
+    case fix(String, Layout)
+    case leave
+    case unknown
+}
+
+/// Короткие слова: решение целиком по спискам исключений, без словаря.
+///
+/// Буквенность проверяем отдельно и с обеих сторон. «,» на русской раскладке — это «б»,
+/// то есть формально часть слова; без этой проверки одинокая запятая перед пробелом
+/// превратилась бы в букву.
+private func shortWordVerdict(word: String, fixed: String,
+                              source: String, target: String, to: Layout) -> Verdict {
+    guard word.allSatisfy({ $0.isLetter }), fixed.allSatisfy({ $0.isLetter }) else { return .leave }
+    if shortWordExceptions[source]?.contains(word.lowercased()) == true { return .leave }
+    if LearnedWords.shared.contains(word, language: source) { return .leave }
+    if shortWordExceptions[target]?.contains(fixed.lowercased()) == true { return .fix(fixed, to) }
+    // Раз человек перебил «шт» в «in» руками, это его собственное решение, а не догадка.
+    if LearnedWords.shared.contains(fixed, language: target) { return .fix(fixed, to) }
+    return .leave
+}
+
 /// Решает, надо ли чинить слово, и если да — возвращает исправленный вариант и целевую раскладку.
-func evaluate(word: String, layouts: [Layout]) -> (fixed: String, to: Layout)? {
+///
+/// `allowLookup: false` — режим колбэка тапа: отвечаем только тем, что уже в кеше словаря,
+/// а на промахе честно говорим `.unknown`, чтобы спросили снаружи.
+func evaluate(word: String, layouts: [Layout], allowLookup: Bool = true) -> Verdict {
     guard word.count >= Settings.shared.shortWordRule.minimumLength,
-          word.allSatisfy({ isWordCharacter($0, layouts: layouts) }) else { return nil }
+          word.allSatisfy({ isWordCharacter($0, layouts: layouts) }) else { return .leave }
     guard let (from, to) = guessDirection(word, layouts: layouts),
           let sourceLanguage = dictionaryLanguage(for: from),
           let targetLanguage = dictionaryLanguage(for: to),
-          sourceLanguage != targetLanguage else { return nil }
-
-    // Слово нормально читается как есть — не лезем.
-    guard !isRealWord(word, language: sourceLanguage) else { return nil }
+          sourceLanguage != targetLanguage else { return .leave }
 
     let fixed = convert(word, from: from, to: to)
 
-    // Короткое слово проверяем по списку частотных (см. commonShortWords) либо по выученному:
-    // раз человек перебил «шт» в «in» руками, это его собственное решение, а не догадка.
+    // Один-два символа — свой мир, со словарём не разговариваем вовсе.
     if word.count < 3 {
-        guard commonShortWords[targetLanguage]?.contains(fixed.lowercased()) == true
-                || LearnedWords.shared.contains(fixed, language: targetLanguage)
-        else { return nil }
-        return (fixed, to)
+        return shortWordVerdict(word: word, fixed: fixed,
+                                source: sourceLanguage, target: targetLanguage, to: to)
+    }
+
+    // Слово нормально читается как есть — не лезем.
+    if let known = cachedRealWord(word, language: sourceLanguage) {
+        if known { return .leave }
+    } else {
+        guard allowLookup else { return .unknown }
+        if isRealWord(word, language: sourceLanguage) { return .leave }
     }
 
     // Обычный случай: результат — настоящее слово другого языка, целиком из букв.
-    if isRealWord(fixed, language: targetLanguage) { return (fixed, to) }
+    if let known = cachedRealWord(fixed, language: targetLanguage) {
+        if known { return .fix(fixed, to) }
+    } else {
+        guard allowLookup else { return .unknown }
+        if isRealWord(fixed, language: targetLanguage) { return .fix(fixed, to) }
+    }
 
     // Особый случай: почта, домен, ссылка. Словарём их не проверить, зато структура
     // однозначна — случайный русский текст в валидный адрес не превращается.
-    if looksLikeAddress(fixed), !looksLikeAddress(word) { return (fixed, to) }
+    if looksLikeAddress(fixed), !looksLikeAddress(word) { return .fix(fixed, to) }
 
-    return nil
+    return .leave
 }
 
 /// Стирает набранное слово и печатает исправленное вместе с разделителем.
 /// Разделитель мы перехватили и до экрана не пустили, поэтому стираем ровно слово.
 private func ms(_ from: Date, _ to: Date) -> Int { Int(to.timeIntervalSince(from) * 1000) }
 
-private func applyFix(word: String, separator: Character, fixed: String, to layout: Layout) {
+private func applyFix(word: String, separator: Character, fixed: String, to layout: Layout,
+                      separatorOnScreen: Bool = false) {
     let started = Date()
     defer { trace("правка «\(word)» заняла \(Int(Date().timeIntervalSince(started) * 1000)) мс") }
-    let echo = fixed + String(separator)
-    expectEcho(backspaces: word.count, text: echo)
+    // Догоняющая правка: разделитель до экрана уже доехал, да и человек мог успеть начать
+    // следующее слово. Стираем всё это и печатаем заново — иначе правка встанет посреди
+    // набранного. При обычной правке стирать нечего: разделитель мы придержали.
+    let pending = separatorOnScreen ? buffer : ""
+    let erase = word.count + (separatorOnScreen ? 1 + pending.count : 0)
+    let echo = fixed + String(separator) + pending
+    expectEcho(backspaces: erase, text: echo)
     // Слово завершено разделителем — новое начинается с чистого листа. Чистим сразу:
-    // отложенная чистка стирала бы первые буквы следующего слова.
-    buffer = ""
-    for _ in 0..<word.count { postMarked(keyBackspace) }
+    // отложенная чистка стирала бы первые буквы следующего слова. Набранное следом
+    // возвращаем как есть, поэтому буфер догоняющей правки переживает её нетронутым.
+    if !separatorOnScreen { buffer = "" }
+    for _ in 0..<erase { postMarked(keyBackspace) }
     let erased = Date()
     typeText(echo)
     armEchoDeadline()
     let typed = Date()
-    switchInputSource(to: layout)
+    // Раскладку двигаем только на словах от трёх букв. «фе» -> «at» — слишком слабый повод
+    // увести всю клавиатуру на английский: человек пишет русскую фразу, а следующие слова
+    // после такого переезда выходят латиницей, и чинить приходится уже их.
+    if word.count >= 3 { switchInputSource(to: layout) }
     trace("шаги: ⌫ \(ms(started, erased)) мс, печать \(ms(erased, typed)) мс, раскладка \(ms(typed, Date())) мс")
     lastFix = (word, fixed)
     announce(before: word, after: fixed, auto: true)
@@ -227,7 +301,7 @@ func setTypedBuffer(_ text: String) { buffer = text }
 private func handleKeyDown(_ event: CGEvent) -> Bool {
     // Фокус в поле пароля: система включает Secure Input. Ничего не копим и не помним.
     if IsSecureEventInputEnabled() {
-        buffer = ""
+        invalidateWord()
         return false
     }
     // Наша собственная печать (метку потеряла по дороге) — мимо буфера, но в приложение.
@@ -238,12 +312,12 @@ private func handleKeyDown(_ event: CGEvent) -> Bool {
     if flags.contains(.maskAlternate) { return false }
     // Любой аккорд с ⌘/⌃ — это команда, а не набор текста.
     if flags.contains(.maskCommand) || flags.contains(.maskControl) {
-        buffer = ""
+        invalidateWord()
         return false
     }
 
     let code = event.getIntegerValueField(.keyboardEventKeycode)
-    if resetKeys.contains(code) { buffer = ""; return false }
+    if resetKeys.contains(code) { invalidateWord(); return false }
     if code == Int64(keyBackspace) {
         if !buffer.isEmpty { buffer.removeLast() }
         return false
@@ -274,18 +348,47 @@ private func handleKeyDown(_ event: CGEvent) -> Bool {
     // Автоматически чиним только если автомат включён; следить за словом — всё равно следим.
     guard Settings.shared.autoEnabled else { return false }
     guard !word.isEmpty else { return false }
-    guard let (fixed, target) = evaluate(word: word, layouts: activeLayouts(from: autoLayouts))
-    else {
+    let layouts = activeLayouts(from: autoLayouts)
+    // В колбэке спрашиваем только кеш: обращение к системному словарю здесь стоит тапа.
+    switch evaluate(word: word, layouts: layouts, allowLookup: false) {
+    case .fix(let fixed, let target):
+        trace("авто: слово «\(word)» -> «\(fixed)»")
+        // Из колбэка тапа выходим быстро: правку делаем следующим тиком главного цикла.
+        // Сам разделитель проглатываем и допечатаем его в конце — иначе он встанет в текст
+        // раньше правки и его пришлось бы стирать отдельным backspace.
+        DispatchQueue.main.async {
+            applyFix(word: word, separator: character, fixed: fixed, to: target)
+        }
+        return true
+    case .leave:
         trace("авто: слово «\(word)» — оставляю как есть")
         return false
+    case .unknown:
+        // Слово словарю ещё не показывали. Спросим на главном потоке, а разделитель пропустим
+        // сейчас: держать его — значит держать колбэк, а это ровно та задержка, из-за которой
+        // система снимает перехват. Правка будет догоняющей (см. applyFix).
+        let epoch = inputEpoch
+        DispatchQueue.main.async {
+            evaluateOffTap(word: word, separator: character, layouts: layouts, epoch: epoch)
+        }
+        return false
     }
-    trace("авто: слово «\(word)» -> «\(fixed)»")
+}
 
-    // Из колбэка тапа выходим быстро: правку делаем следующим тиком главного цикла.
-    // Сам разделитель проглатываем и допечатаем его в конце — иначе он встанет в текст
-    // раньше правки и его пришлось бы стирать отдельным backspace.
-    DispatchQueue.main.async { applyFix(word: word, separator: character, fixed: fixed, to: target) }
-    return true
+/// Догоняющая проверка: слово уже на экране вместе с разделителем, спрашиваем словарь спокойно.
+private func evaluateOffTap(word: String, separator: Character, layouts: [Layout], epoch: Int) {
+    guard case .fix(let fixed, let target) = evaluate(word: word, layouts: layouts) else {
+        trace("авто (вдогонку): слово «\(word)» — оставляю как есть")
+        return
+    }
+    // Пока спрашивали словарь, человек нажал Enter, стрелку или щёлкнул мышью: стирать
+    // теперь нечего и опасно — правка отменяется.
+    guard inputEpoch == epoch else {
+        trace("авто (вдогонку): «\(word)» — ввод ушёл дальше, правку отменяю")
+        return
+    }
+    trace("авто (вдогонку): слово «\(word)» -> «\(fixed)»")
+    applyFix(word: word, separator: separator, fixed: fixed, to: target, separatorOnScreen: true)
 }
 
 private let tapCallback: CGEventTapCallBack = { _, type, event, _ in
@@ -302,9 +405,12 @@ private let tapCallback: CGEventTapCallBack = { _, type, event, _ in
     case .flagsChanged:
         handleFlagsChanged(event)
     case .leftMouseDown, .rightMouseDown:
-        buffer = ""            // курсор уехал — слово больше не наше
+        invalidateWord()       // курсор уехал — слово больше не наше
     case .tapDisabledByTimeout, .tapDisabledByUserInput:
-        trace("система отключила тап (\(type.rawValue)) — включаю обратно")
+        // Пока тап был снят, часть клавиш прошла мимо нас: в буфере лежит огрызок слова,
+        // и проверять его — значит гадать. Начинаем со следующего слова.
+        trace("система отключила тап (\(type.rawValue)) — включаю обратно, буфер сброшен")
+        invalidateWord()
         if let tap = activeTap { CGEvent.tapEnable(tap: tap, enable: true) }
     default:
         break

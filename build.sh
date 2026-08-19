@@ -45,36 +45,58 @@ PLIST
 # Универсальный доступ. С сертификатом требование звучит как «идентификатор local.switcher
 # и leaf-сертификат такой-то» — хэш меняется, права остаются.
 IDENTITY="Switcher Self Signed"
-xattr -cr "$APP"        # иначе codesign споткнётся о расширенные атрибуты
+
+# Подписываем не на месте, а в копии вне iCloud.
+#
+# Папка проекта лежит на Рабочем столе, а он синхронизируется: iCloud вешает на бандл
+# com.apple.FinderInfo и com.apple.fileprovider.fpfs#P и возвращает их сразу после
+# xattr -cr. Для codesign это «resource fork, Finder information, or similar detritus
+# not allowed» — подпись сертификатом падает, остаётся ad-hoc, и Универсальный доступ
+# слетает на ровном месте. Во временном каталоге атрибутов взяться неоткуда.
+STAGE="$(mktemp -d)"
+cp -R "$APP" "$STAGE/Switcher.app"
+xattr -cr "$STAGE/Switcher.app"
 # Стоит открыть папку сборки в Finder — и внутри бандла заводится .DS_Store. Для codesign
-# это «detritus not allowed»: подпись сертификатом падает, а вместе с ней молча уезжают права.
-find "$APP" -name .DS_Store -delete
+# это тот же «detritus not allowed».
+find "$STAGE/Switcher.app" -name .DS_Store -delete
 
 if security find-certificate -c "$IDENTITY" >/dev/null 2>&1; then
     # Ошибку codesign показываем: спрятав её, мы получаем ad-hoc подпись и сброшенный
     # Универсальный доступ — без единого намёка на причину.
-    codesign --force --sign "$IDENTITY" "$APP" \
+    codesign --force --sign "$IDENTITY" "$STAGE/Switcher.app" \
         || echo "предупреждение: подписать сертификатом не удалось (см. ошибку выше)"
 else
     echo "предупреждение: сертификата «$IDENTITY» нет в связке ключей, подписываю ad-hoc"
     echo "               (права Универсального доступа будут слетать при каждой сборке)"
-    codesign --force --sign - "$APP" >/dev/null 2>&1
+    codesign --force --sign - "$STAGE/Switcher.app" >/dev/null 2>&1
 fi
+
+# Подписанный бандл возвращаем на место: сама подпись лежит внутри файлов, поэтому
+# копирование обратно в iCloud её не портит — портит только повторный codesign там же.
+rm -rf "$APP"
+cp -R "$STAGE/Switcher.app" "$APP"
 
 # Установленную копию трогаем ТОЛЬКО по явной просьбе: ad-hoc подпись меняется на каждой
 # сборке, macOS видит новую программу и сбрасывает выданный ей доступ. Пересобирать
 # по десять раз и каждый раз заново выдавать права — невыносимо, поэтому ./build.sh --install.
 if [ "$1" = "--install" ]; then
+    # Ставим уже подписанную копию из STAGE и заново не подписываем: повторная подпись
+    # ничего не добавляет, а вот сорваться в ad-hoc может.
+    osascript -e 'quit app "Switcher"' >/dev/null 2>&1 || true
+    # Дожидаемся, пока процесс действительно уйдёт: если открыть приложение, пока LaunchServices
+    # ещё держит прежний экземпляр, open отвечает «error -609» и не запускает ничего.
+    for _ in $(seq 20); do
+        pgrep -f "Switcher.app/Contents/MacOS/Switcher" >/dev/null || break
+        sleep 0.25
+    done
     rm -rf /Applications/Switcher.app
-    cp -R "$APP" /Applications/
-    xattr -cr /Applications/Switcher.app
-    if security find-certificate -c "$IDENTITY" >/dev/null 2>&1; then
-        codesign --force --sign "$IDENTITY" /Applications/Switcher.app >/dev/null 2>&1 || true
-    else
-        codesign --force --sign - /Applications/Switcher.app >/dev/null 2>&1 || true
-    fi
+    cp -R "$STAGE/Switcher.app" /Applications/
     echo "  обновлено: /Applications/Switcher.app"
+    sleep 1
+    open -a /Applications/Switcher.app
 fi
+
+rm -rf "$STAGE"
 
 echo "собрано:"
 echo "  CLI: $(pwd)/switcher"
