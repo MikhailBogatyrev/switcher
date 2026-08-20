@@ -195,21 +195,26 @@ func evaluate(word: String, layouts: [Layout], allowLookup: Bool = true) -> Verd
 /// Разделитель мы перехватили и до экрана не пустили, поэтому стираем ровно слово.
 private func ms(_ from: Date, _ to: Date) -> Int { Int(to.timeIntervalSince(from) * 1000) }
 
-private func applyFix(word: String, separator: Character, fixed: String, to layout: Layout,
-                      separatorOnScreen: Bool = false) {
+/// - `separator`: символ, завершивший слово, — его допечатываем сами. `nil` для Enter:
+///   он не символ, и возвращается отдельным нажатием уже после правки.
+/// - `alreadyOnScreen`: слово успело уехать на экран вместе со всем, что человек набрал
+///   следом. Тогда стирать надо и это тоже.
+private func applyFix(word: String, separator: Character?, fixed: String, to layout: Layout,
+                      alreadyOnScreen: Bool = false) {
     let started = Date()
     defer { trace("правка «\(word)» заняла \(Int(Date().timeIntervalSince(started) * 1000)) мс") }
     // Догоняющая правка: разделитель до экрана уже доехал, да и человек мог успеть начать
     // следующее слово. Стираем всё это и печатаем заново — иначе правка встанет посреди
     // набранного. При обычной правке стирать нечего: разделитель мы придержали.
-    let pending = separatorOnScreen ? buffer : ""
-    let erase = word.count + (separatorOnScreen ? 1 + pending.count : 0)
-    let echo = fixed + String(separator) + pending
+    let pending = alreadyOnScreen ? buffer : ""
+    let separatorOnScreen = alreadyOnScreen && separator != nil
+    let erase = word.count + (separatorOnScreen ? 1 : 0) + pending.count
+    let echo = fixed + (separator.map(String.init) ?? "") + pending
     expectEcho(backspaces: erase, text: echo)
     // Слово завершено разделителем — новое начинается с чистого листа. Чистим сразу:
     // отложенная чистка стирала бы первые буквы следующего слова. Набранное следом
     // возвращаем как есть, поэтому буфер догоняющей правки переживает её нетронутым.
-    if !separatorOnScreen { buffer = "" }
+    if !alreadyOnScreen { buffer = "" }
     for _ in 0..<erase { postMarked(keyBackspace) }
     let erased = Date()
     typeText(echo)
@@ -317,6 +322,9 @@ private func handleKeyDown(_ event: CGEvent) -> Bool {
     }
 
     let code = event.getIntegerValueField(.keyboardEventKeycode)
+    if code == Int64(keyReturn) || code == Int64(keyNumpadReturn) {
+        return handleReturn(code: CGKeyCode(code), flags: flags)
+    }
     if resetKeys.contains(code) { invalidateWord(); return false }
     if code == Int64(keyBackspace) {
         if !buffer.isEmpty { buffer.removeLast() }
@@ -375,6 +383,54 @@ private func handleKeyDown(_ event: CGEvent) -> Bool {
     }
 }
 
+/// Enter завершает слово не хуже пробела, но чинить после него нечего: сообщение отправлено,
+/// строка закрыта, а наши ⌫ прилетят уже в пустое поле. Поэтому Enter придерживаем ровно так
+/// же, как разделитель: сначала правка, потом нажатие — и уходит уже исправленное слово.
+///
+/// Придерживаем не всегда. Пустой буфер и слова, про которые ответ «оставить как есть» уже
+/// известен, отпускают Enter немедленно: задержка отправки на ровном месте не нужна, а
+/// синтетическое нажатие — лишний способ не отправить сообщение вовсе.
+private func handleReturn(code: CGKeyCode, flags: CGEventFlags) -> Bool {
+    let word = buffer
+    invalidateWord()          // слово закрыто в любом случае
+    guard Settings.shared.autoEnabled, !word.isEmpty else { return false }
+    let layouts = activeLayouts(from: autoLayouts)
+    // Поколение считаем уже после invalidateWord: сменится оно только если человек успел
+    // щёлкнуть мышью или нажать что-то ещё, пока мы держим Enter. Тогда стирать нельзя —
+    // курсор уже не там, — но сам Enter вернуть всё равно обязаны.
+    let epoch = inputEpoch
+
+    switch evaluate(word: word, layouts: layouts, allowLookup: false) {
+    case .leave:
+        trace("Enter: слово «\(word)» — оставляю как есть")
+        return false
+    case .fix(let fixed, let target):
+        trace("Enter: слово «\(word)» -> «\(fixed)»")
+        DispatchQueue.main.async {
+            if inputEpoch == epoch {
+                applyFix(word: word, separator: nil, fixed: fixed, to: target, alreadyOnScreen: true)
+            }
+            postMarked(code, flags: flags)
+        }
+        return true
+    case .unknown:
+        // Ответ знает только словарь. Спрашиваем вне колбэка, а Enter возвращаем в любом
+        // случае — и когда починили, и когда чинить оказалось нечего. Проглотить его
+        // насовсем значит съесть отправку сообщения.
+        DispatchQueue.main.async {
+            if inputEpoch == epoch,
+               case .fix(let fixed, let target) = evaluate(word: word, layouts: layouts) {
+                trace("Enter (вдогонку): слово «\(word)» -> «\(fixed)»")
+                applyFix(word: word, separator: nil, fixed: fixed, to: target, alreadyOnScreen: true)
+            } else {
+                trace("Enter (вдогонку): слово «\(word)» — оставляю как есть")
+            }
+            postMarked(code, flags: flags)
+        }
+        return true
+    }
+}
+
 /// Догоняющая проверка: слово уже на экране вместе с разделителем, спрашиваем словарь спокойно.
 private func evaluateOffTap(word: String, separator: Character, layouts: [Layout], epoch: Int) {
     guard case .fix(let fixed, let target) = evaluate(word: word, layouts: layouts) else {
@@ -388,7 +444,7 @@ private func evaluateOffTap(word: String, separator: Character, layouts: [Layout
         return
     }
     trace("авто (вдогонку): слово «\(word)» -> «\(fixed)»")
-    applyFix(word: word, separator: separator, fixed: fixed, to: target, separatorOnScreen: true)
+    applyFix(word: word, separator: separator, fixed: fixed, to: target, alreadyOnScreen: true)
 }
 
 private let tapCallback: CGEventTapCallBack = { _, type, event, _ in

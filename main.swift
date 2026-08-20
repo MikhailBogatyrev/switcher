@@ -144,6 +144,7 @@ func guessDirection(_ text: String, layouts: [Layout]) -> (from: Layout, to: Lay
 let keyC: CGKeyCode = 8, keyV: CGKeyCode = 9
 let keyLeft: CGKeyCode = 123, keyRight: CGKeyCode = 124
 let keyBackspace: CGKeyCode = 51
+let keyReturn: CGKeyCode = 36, keyNumpadReturn: CGKeyCode = 76
 
 /// Метка на собственных событиях, чтобы перехватчик автомата не принял их за ввод пользователя
 /// и не зациклил починку сам на себе.
@@ -168,11 +169,13 @@ func forceReleaseModifiers() {
     usleep(20_000)
 }
 
-func postMarked(_ code: CGKeyCode) {
+/// `flags` задаём только там, где они несут смысл: ⇧Enter в чатах — это перенос строки,
+/// а не отправка, и потерять модификатор значит отправить недописанное сообщение.
+func postMarked(_ code: CGKeyCode, flags: CGEventFlags = []) {
     let source = CGEventSource(stateID: .hidSystemState)
     for isDown in [true, false] {
         let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: isDown)
-        event?.flags = []          // чистим унаследованные модификаторы
+        event?.flags = flags       // по умолчанию чисто: унаследованные модификаторы нам вредны
         event?.setIntegerValueField(.eventSourceUserData, value: selfMarker)
         event?.post(tap: .cghidEventTap)
     }
