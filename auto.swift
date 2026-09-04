@@ -82,6 +82,50 @@ func isRealWord(_ word: String, language: String) -> Bool {
     return result
 }
 
+/// Английские сокращения: «I've», «don't», «it's», «isn't».
+///
+/// Спрашивать словарь про строку с апострофом нельзя — на пунктуации NSSpellChecker слов не
+/// находит и рапортует «ошибок нет», то есть подтверждает любую кашу. Поэтому апостроф
+/// разбираем сами: справа должен стоять один из хвостов, которых в английском ровно горстка,
+/// слева — настоящее слово, и вот его уже можно спросить у словаря, потому что оно из букв.
+private let contractionTails: Set<String> = ["s", "t", "ve", "re", "ll", "d", "m"]
+
+/// Основа сокращения — то, что надо проверить по словарю. Их две только у «n't»: в «can't»
+/// словом оказывается «can», а в «isn't» — «is», и заранее не угадать, чей это случай.
+private func contractionStems(_ word: String, language: String) -> [String] {
+    guard language == "en" else { return [] }
+    let parts = word.replacingOccurrences(of: "\u{2019}", with: "'")
+        .split(separator: "'", omittingEmptySubsequences: false)
+    guard parts.count == 2 else { return [] }
+    let stem = String(parts[0])
+    let tail = String(parts[1]).lowercased()
+    guard !stem.isEmpty, contractionTails.contains(tail),
+          stem.allSatisfy({ $0.isLetter }) else { return [] }
+    guard tail == "t", stem.lowercased().hasSuffix("n") else { return [stem] }
+    return [stem, String(stem.dropLast())]
+}
+
+/// Настоящее ли это слово — с апострофом или без. nil означает «ответ есть только у словаря,
+/// а спрашивать его сейчас нельзя» (см. cachedRealWord).
+private func knownWord(_ word: String, language: String, allowLookup: Bool) -> Bool? {
+    var candidates = [word]
+    if !word.allSatisfy({ $0.isLetter }) {
+        candidates = contractionStems(word, language: language)
+        if candidates.isEmpty { return false }
+    }
+    var sawUnknown = false
+    for candidate in candidates {
+        if let known = cachedRealWord(candidate, language: language) {
+            if known { return true }
+        } else if allowLookup {
+            if isRealWord(candidate, language: language) { return true }
+        } else {
+            sawUnknown = true
+        }
+    }
+    return sawUnknown ? nil : false
+}
+
 /// Первый запрос к словарю грузит его с диска и может занять десятки миллисекунд.
 /// В колбэке перехвата такая пауза стоит отключения тапа системой, поэтому греем заранее.
 func warmUpDictionaries(_ layouts: [Layout]) {
@@ -169,19 +213,17 @@ func evaluate(word: String, layouts: [Layout], allowLookup: Bool = true) -> Verd
     }
 
     // Слово нормально читается как есть — не лезем.
-    if let known = cachedRealWord(word, language: sourceLanguage) {
-        if known { return .leave }
-    } else {
-        guard allowLookup else { return .unknown }
-        if isRealWord(word, language: sourceLanguage) { return .leave }
+    switch knownWord(word, language: sourceLanguage, allowLookup: allowLookup) {
+    case .some(true): return .leave
+    case .none: return .unknown
+    case .some(false): break
     }
 
-    // Обычный случай: результат — настоящее слово другого языка, целиком из букв.
-    if let known = cachedRealWord(fixed, language: targetLanguage) {
-        if known { return .fix(fixed, to) }
-    } else {
-        guard allowLookup else { return .unknown }
-        if isRealWord(fixed, language: targetLanguage) { return .fix(fixed, to) }
+    // Обычный случай: результат — настоящее слово другого языка.
+    switch knownWord(fixed, language: targetLanguage, allowLookup: allowLookup) {
+    case .some(true): return .fix(fixed, to)
+    case .none: return .unknown
+    case .some(false): break
     }
 
     // Особый случай: почта, домен, ссылка. Словарём их не проверить, зато структура
