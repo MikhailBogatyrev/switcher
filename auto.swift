@@ -126,6 +126,67 @@ private func knownWord(_ word: String, language: String, allowLookup: Bool) -> B
     return sawUnknown ? nil : false
 }
 
+/// Дамерау—Левенштейн: перестановка соседних букв стоит одну ошибку, а не две. Именно так
+/// выглядит промах по клавише — «переключил» превращается в «прееключил».
+private func editDistance(_ a: [Character], _ b: [Character]) -> Int {
+    guard !a.isEmpty, !b.isEmpty else { return max(a.count, b.count) }
+    var d = Array(repeating: Array(repeating: 0, count: b.count + 1), count: a.count + 1)
+    for i in 0...a.count { d[i][0] = i }
+    for j in 0...b.count { d[0][j] = j }
+    for i in 1...a.count {
+        for j in 1...b.count {
+            let cost = a[i - 1] == b[j - 1] ? 0 : 1
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1, j > 1, a[i - 1] == b[j - 2], a[i - 2] == b[j - 1] {
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+            }
+        }
+    }
+    return d[a.count][b.count]
+}
+
+/// Слово с опечаткой: после перебивки получается не словарное слово, а почти словарное.
+///
+/// Опечатка — не редкость, а норма набора, и ровно на ней автомат замолкал: «ghttrk.xbk»
+/// даёт «прееключил» (буквы переставлены), словарь такого не знает, и строка оставалась
+/// латиницей целиком, посреди уже починенной фразы. Поэтому спрашиваем у словаря подсказки:
+/// если среди них есть слово в одной ошибке от нашего, человек писал на этом языке — и мы
+/// переводим строку как есть. Саму опечатку не трогаем, это не наше дело: подчеркнуть её
+/// умеет и текстовое поле.
+///
+/// Порог в пять букв — не украшение. На коротких строках подсказки находятся почти всегда
+/// («тзь» → «язь», «фыв» → «фев»), и без порога `npm` с `asdf` уехали бы в кириллицу.
+/// На полусотне типовых латинских слов (npm, kubectl, github, webpack, vercel…) правило
+/// срабатывает один раз, и то на имени собственном — потому подсказки с прописной буквы
+/// для слова со строчной не в счёт.
+private let looseMinimumLength = 5
+private var looseCache: [String: Bool] = [:]
+
+private func computeNearRealWord(_ word: String, language: String) -> Bool {
+    let range = NSRange(location: 0, length: (word as NSString).length)
+    let guesses = NSSpellChecker.shared.guesses(forWordRange: range, in: word, language: language,
+                                                inSpellDocumentWithTag: 0) ?? []
+    let typed = Array(word.lowercased())
+    let startsLower = word.first?.isLowercase == true
+    for guess in guesses.prefix(8) {
+        if startsLower, guess.first?.isUppercase == true { continue }   // имя собственное
+        if editDistance(typed, Array(guess.lowercased())) <= 1 { return true }
+    }
+    return false
+}
+
+/// nil — «ответ есть только у словаря, а спрашивать его сейчас нельзя» (см. cachedRealWord).
+private func nearRealWord(_ word: String, language: String, allowLookup: Bool) -> Bool? {
+    guard word.count >= looseMinimumLength, word.allSatisfy({ $0.isLetter }) else { return false }
+    let key = language + ":" + word
+    if let known = looseCache[key] { return known }
+    guard allowLookup else { return nil }
+    let result = computeNearRealWord(word, language: language)
+    if looseCache.count > 5000 { looseCache.removeAll() }
+    looseCache[key] = result
+    return result
+}
+
 /// Первый запрос к словарю грузит его с диска и может занять десятки миллисекунд.
 /// В колбэке перехвата такая пауза стоит отключения тапа системой, поэтому греем заранее.
 func warmUpDictionaries(_ layouts: [Layout]) {
@@ -222,6 +283,20 @@ func evaluate(word: String, layouts: [Layout], allowLookup: Bool = true) -> Verd
     // Обычный случай: результат — настоящее слово другого языка.
     switch knownWord(fixed, language: targetLanguage, allowLookup: allowLookup) {
     case .some(true): return .fix(fixed, to)
+    case .none: return .unknown
+    case .some(false): break
+    }
+
+    // Слово с опечаткой: словарного совпадения нет, но есть подсказка в одной ошибке.
+    switch nearRealWord(fixed, language: targetLanguage, allowLookup: allowLookup) {
+    case .some(true):
+        // Ровно один случай, когда это ошибка: опечатка в языке набора. «recieve» — кривой
+        // английский, а не русский текст, и уезжать в кириллицу он не должен.
+        switch nearRealWord(word, language: sourceLanguage, allowLookup: allowLookup) {
+        case .some(true): return .leave
+        case .none: return .unknown
+        case .some(false): return .fix(fixed, to)
+        }
     case .none: return .unknown
     case .some(false): break
     }
