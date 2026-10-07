@@ -71,12 +71,28 @@ func cachedRealWord(_ word: String, language: String) -> Bool? {
     return spellCache[language + ":" + word]
 }
 
+/// Прописная буква не в начале слова: «УчЖ», «QwX», «СССР». Словарь такие строки считает
+/// сокращениями и подтверждает любую.
+private func looksLikeAbbreviation(_ word: String) -> Bool {
+    word.dropFirst().contains { $0.isUppercase }
+}
+
+private func spellCheck(_ word: String, language: String) -> Bool {
+    NSSpellChecker.shared.checkSpelling(
+        of: word, startingAt: 0, language: language,
+        wrap: false, inSpellDocumentWithTag: 0, wordCount: nil).location == NSNotFound
+}
+
 func isRealWord(_ word: String, language: String) -> Bool {
     if let known = cachedRealWord(word, language: language) { return known }
-    let range = NSSpellChecker.shared.checkSpelling(
-        of: word, startingAt: 0, language: language,
-        wrap: false, inSpellDocumentWithTag: 0, wordCount: nil)
-    let result = range.location == NSNotFound
+    var result = spellCheck(word, language: language)
+    // Дыра размером с «Ex:». Двоеточие на русской раскладке — это «Ж», перебивка даёт «УчЖ»,
+    // словарь отвечает «настоящее русское слово» (хотя «учж» не знает), и набранный
+    // по-английски текст уверенно уезжает в кириллицу. Поэтому у строки с необычным
+    // регистром спрашиваем ещё и нижний: настоящее слово его переживает, сокращение — нет.
+    if result, looksLikeAbbreviation(word) {
+        result = spellCheck(word.lowercased(), language: language)
+    }
     if spellCache.count > 5000 { spellCache.removeAll() }
     spellCache[language + ":" + word] = result
     return result
@@ -177,7 +193,8 @@ private func computeNearRealWord(_ word: String, language: String) -> Bool {
 
 /// nil — «ответ есть только у словаря, а спрашивать его сейчас нельзя» (см. cachedRealWord).
 private func nearRealWord(_ word: String, language: String, allowLookup: Bool) -> Bool? {
-    guard word.count >= looseMinimumLength, word.allSatisfy({ $0.isLetter }) else { return false }
+    guard word.count >= looseMinimumLength, word.allSatisfy({ $0.isLetter }),
+          !looksLikeAbbreviation(word) else { return false }
     let key = language + ":" + word
     if let known = looseCache[key] { return known }
     guard allowLookup else { return nil }
@@ -245,11 +262,18 @@ enum Verdict {
 private func shortWordVerdict(word: String, fixed: String,
                               source: String, target: String, to: Layout) -> Verdict {
     guard word.allSatisfy({ $0.isLetter }), fixed.allSatisfy({ $0.isLetter }) else { return .leave }
-    if shortWordExceptions[source]?.contains(word.lowercased()) == true { return .leave }
+
+    // Выученное идёт первым: это решение человека, а не наша догадка, и оно весомее любого
+    // правила ниже. Иначе урок «ФШ -> AI» не применился бы никогда — запрет на аббревиатуры
+    // отвечал бы раньше, чем мы вспомним, что этому нас уже научили.
     if LearnedWords.shared.contains(word, language: source) { return .leave }
-    if shortWordExceptions[target]?.contains(fixed.lowercased()) == true { return .fix(fixed, to) }
-    // Раз человек перебил «шт» в «in» руками, это его собственное решение, а не догадка.
     if LearnedWords.shared.contains(fixed, language: target) { return .fix(fixed, to) }
+
+    // «TT» -> «ЕЕ»: в списке исключений живут служебные слова, и пишут их строчными. Строка
+    // с прописной не в начале — это аббревиатура (TT, AI, UX, PR), и ею список не распоряжается.
+    guard !looksLikeAbbreviation(word), !looksLikeAbbreviation(fixed) else { return .leave }
+    if shortWordExceptions[source]?.contains(word.lowercased()) == true { return .leave }
+    if shortWordExceptions[target]?.contains(fixed.lowercased()) == true { return .fix(fixed, to) }
     return .leave
 }
 
