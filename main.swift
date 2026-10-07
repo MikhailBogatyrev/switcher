@@ -463,8 +463,19 @@ func fixSelection(layouts allLayouts: [Layout]) {
     if mode == .lastWord {
         let typed = currentTypedWord()
         trace("слежение: «\(typed)»")
-        guard !typed.isEmpty else { toggleKeyboardLayout(layouts); return }
-        applyManualFix(text: typed, viaSelection: false, layouts: layouts)
+        if !typed.isEmpty {
+            applyManualFix(text: typed, viaSelection: false, layouts: layouts)
+            return
+        }
+        // Буфер пуст — слово закончено разделителем. Берём его вместе с разделителем:
+        // стираем оба, печатаем перебитое слово и возвращаем разделитель на место.
+        if let last = lastCompletedWord() {
+            trace("слежение: слово закончено, за ним «\(last.separator)»")
+            applyManualFix(text: last.text, viaSelection: false, layouts: layouts,
+                           separator: last.separator)
+            return
+        }
+        toggleKeyboardLayout(layouts)
         return
     }
 
@@ -500,7 +511,10 @@ func fixSelection(layouts allLayouts: [Layout]) {
 
 /// Единая точка перебивки: чинит текст, печатает результат, переключает раскладку.
 /// `viaSelection` — заменять выделение (delete+type) или переписывать последнее слово по слежению.
-private func applyManualFix(text: String, viaSelection: Bool, layouts: [Layout]) {
+/// `separator` — знак, уже стоящий на экране за словом. Его стираем вместе со словом и
+/// печатаем заново: иначе backspace\'ы съели бы хвост самого слова, а не разделитель.
+private func applyManualFix(text: String, viaSelection: Bool, layouts: [Layout],
+                            separator: Character? = nil) {
     let direction = guessDirection(text, layouts: layouts) ?? directionFromCurrentLayout(layouts)
     guard let (from, to) = direction else { toggleKeyboardLayout(layouts); return }
 
@@ -511,12 +525,20 @@ private func applyManualFix(text: String, viaSelection: Bool, layouts: [Layout])
     if viaSelection {
         replaceSelection(with: fixed)
     } else {
+        let tail = separator.map(String.init) ?? ""
         // Гасим ровно своё эхо, иначе синтетические backspace/символы съедят буфер.
-        expectEcho(backspaces: text.count, text: fixed)
-        setTypedBuffer(fixed)          // повторное нажатие вернёт обратно — toggle
-        for _ in 0..<text.count { postMarked(keyBackspace) }
+        expectEcho(backspaces: text.count + tail.count, text: fixed + tail)
+        if let separator {
+            // Слово снова закончено: в буфере ему делать нечего, а повторное нажатие
+            // должно вернуть всё обратно — для этого помним уже перебитый вариант.
+            setTypedBuffer("")
+            setLastCompleted((fixed, separator))
+        } else {
+            setTypedBuffer(fixed)      // повторное нажатие вернёт обратно — toggle
+        }
+        for _ in 0..<(text.count + tail.count) { postMarked(keyBackspace) }
         usleep(15_000)
-        typeText(fixed)
+        typeText(fixed + tail)
         armEchoDeadline()
     }
     if shouldSwitchLayout(before: text, after: fixed, layouts: layouts) {

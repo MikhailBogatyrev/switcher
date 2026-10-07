@@ -12,6 +12,18 @@ private var autoLayouts: [Layout] = []
 var buffer = ""
 private var lastFix: (typed: String, fixed: String)?
 
+/// Последнее законченное слово и разделитель, которым его закончили, — ровно то, что сейчас
+/// стоит на экране слева от курсора.
+///
+/// Нужно хоткею. Пока слово набирается, оно живёт в буфере, и ⌥/ перебивает его оттуда. Но
+/// стоит нажать пробел — буфер пуст, и хоткею нечего перебивать: он лишь дёргал раскладку.
+/// А это ровно тот момент, когда ⌥/ нужнее всего, потому что автоматическая починка
+/// срабатывает именно на разделителе, и отменять её хочется сразу же.
+private var lastCompleted: (text: String, separator: Character)?
+
+func lastCompletedWord() -> (text: String, separator: Character)? { lastCompleted }
+func setLastCompleted(_ value: (text: String, separator: Character)?) { lastCompleted = value }
+
 /// Номер «поколения» ввода. Растёт всякий раз, когда набранное слово перестаёт быть нашим:
 /// Enter, стрелки, щелчок мышью, аккорд с ⌘, снятый системой тап.
 ///
@@ -22,6 +34,7 @@ private var lastFix: (typed: String, fixed: String)?
 private var inputEpoch = 0
 private func invalidateWord() {
     buffer = ""
+    lastCompleted = nil     // курсор уехал: слева от него уже не то слово
     inputEpoch &+= 1
 }
 
@@ -367,6 +380,8 @@ private func applyFix(word: String, separator: Character?, fixed: String, to lay
     if word.count >= 3 { switchInputSource(to: layout) }
     trace("шаги: ⌫ \(ms(started, erased)) мс, печать \(ms(erased, typed)) мс, раскладка \(ms(typed, Date())) мс")
     lastFix = (word, fixed)
+    // Разделителя на экране нет только в случае Enter — там и перебивать потом нечего.
+    lastCompleted = separator.map { (fixed, $0) }
     announce(before: word, after: fixed, auto: true)
 }
 
@@ -498,6 +513,9 @@ private func handleKeyDown(_ event: CGEvent) -> Bool {
     guard Settings.shared.autoEnabled else { return false }
     guard !word.isEmpty else { return false }
     let layouts = activeLayouts(from: autoLayouts)
+    // Слева от курсора теперь стоит это слово с этим разделителем. Если починка сработает,
+    // applyFix перепишет запись на починенный вариант — хоткею нужно то, что на экране.
+    lastCompleted = (word, character)
     // В колбэке спрашиваем только кеш: обращение к системному словарю здесь стоит тапа.
     switch evaluate(word: word, layouts: layouts, allowLookup: false) {
     case .fix(let fixed, let target):
