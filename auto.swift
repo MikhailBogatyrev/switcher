@@ -353,8 +353,11 @@ private func ms(_ from: Date, _ to: Date) -> Int { Int(to.timeIntervalSince(from
 ///   он не символ, и возвращается отдельным нажатием уже после правки.
 /// - `alreadyOnScreen`: слово успело уехать на экран вместе со всем, что человек набрал
 ///   следом. Тогда стирать надо и это тоже.
+/// `followUpKey` — нажатие, которое надо вернуть после правки: Enter, который мы придержали.
+/// Отдаём его той же очереди, иначе оно уедет раньше самой правки.
 private func applyFix(word: String, separator: Character?, fixed: String, to layout: Layout,
-                      alreadyOnScreen: Bool = false) {
+                      alreadyOnScreen: Bool = false,
+                      followUpKey: (code: CGKeyCode, flags: CGEventFlags)? = nil) {
     let started = Date()
     defer { trace("правка «\(word)» заняла \(Int(Date().timeIntervalSince(started) * 1000)) мс") }
     // Догоняющая правка: разделитель до экрана уже доехал, да и человек мог успеть начать
@@ -369,16 +372,14 @@ private func applyFix(word: String, separator: Character?, fixed: String, to lay
     // отложенная чистка стирала бы первые буквы следующего слова. Набранное следом
     // возвращаем как есть, поэтому буфер догоняющей правки переживает её нетронутым.
     if !alreadyOnScreen { buffer = "" }
-    for _ in 0..<erase { postMarked(keyBackspace) }
-    let erased = Date()
-    typeText(echo)
-    armEchoDeadline()
-    let typed = Date()
-    // Раскладку двигаем только на словах от трёх букв. «фе» -> «at» — слишком слабый повод
-    // увести всю клавиатуру на английский: человек пишет русскую фразу, а следующие слова
-    // после такого переезда выходят латиницей, и чинить приходится уже их.
-    if word.count >= 3 { switchInputSource(to: layout) }
-    trace("шаги: ⌫ \(ms(started, erased)) мс, печать \(ms(erased, typed)) мс, раскладка \(ms(typed, Date())) мс")
+    replaceTyped(backspaces: erase, text: echo, tailKey: followUpKey) {
+        armEchoDeadline()
+        // Раскладку двигаем только на словах от трёх букв. «фе» -> «at» — слишком слабый
+        // повод увести всю клавиатуру на английский: человек пишет русскую фразу, а
+        // следующие слова после такого переезда выходят латиницей, и чинить приходится уже их.
+        if word.count >= 3 { switchInputSource(to: layout) }
+        trace("правка «\(word)» дошла за \(ms(started, Date())) мс")
+    }
     lastFix = (word, fixed)
     // Разделителя на экране нет только в случае Enter — там и перебивать потом нечего.
     lastCompleted = separator.map { (fixed, $0) }
@@ -566,10 +567,9 @@ private func handleReturn(code: CGKeyCode, flags: CGEventFlags) -> Bool {
     case .fix(let fixed, let target):
         trace("Enter: слово «\(word)» -> «\(fixed)»")
         DispatchQueue.main.async {
-            if inputEpoch == epoch {
-                applyFix(word: word, separator: nil, fixed: fixed, to: target, alreadyOnScreen: true)
-            }
-            postMarked(code, flags: flags)
+            guard inputEpoch == epoch else { postMarked(code, flags: flags); return }
+            applyFix(word: word, separator: nil, fixed: fixed, to: target,
+                     alreadyOnScreen: true, followUpKey: (code, flags))
         }
         return true
     case .unknown:
@@ -580,11 +580,12 @@ private func handleReturn(code: CGKeyCode, flags: CGEventFlags) -> Bool {
             if inputEpoch == epoch,
                case .fix(let fixed, let target) = evaluate(word: word, layouts: layouts) {
                 trace("Enter (вдогонку): слово «\(word)» -> «\(fixed)»")
-                applyFix(word: word, separator: nil, fixed: fixed, to: target, alreadyOnScreen: true)
+                applyFix(word: word, separator: nil, fixed: fixed, to: target,
+                         alreadyOnScreen: true, followUpKey: (code, flags))
             } else {
                 trace("Enter (вдогонку): слово «\(word)» — оставляю как есть")
+                postMarked(code, flags: flags)
             }
-            postMarked(code, flags: flags)
         }
         return true
     }

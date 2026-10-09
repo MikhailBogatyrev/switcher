@@ -171,6 +171,45 @@ func forceReleaseModifiers() {
 
 /// `flags` задаём только там, где они несут смысл: ⇧Enter в чатах — это перенос строки,
 /// а не отправка, и потерять модификатор значит отправить недописанное сообщение.
+/// Очередь синтетической печати.
+///
+/// События можно отправлять из любого потока, а вот спать в главном нельзя: на нём сидит
+/// перехватчик клавиатуры, и каждая пауза в нём — окно, в котором система вправе снять тап
+/// вместе с набранными в этот момент клавишами. Поэтому паузы живут здесь.
+let typingQueue = DispatchQueue(label: "switcher.typing", qos: .userInteractive)
+
+/// Пауза между синтетическими нажатиями.
+///
+/// Без неё весь залп уходит в одну миллисекунду. Обычное текстовое поле это переживает, а
+/// тяжёлое веб-приложение — нет: в комментарии Google Sheets из двух ⌫ дошёл один, и
+/// починка «шы» -> «is» оставила на экране «шis». Три миллисекунды незаметны человеку,
+/// но залп перестаёт быть залпом.
+private let keyGap: useconds_t = 3_000
+
+/// Пауза между стиранием и печатью: приложению надо дать обработать удаление, иначе первые
+/// символы встают в ещё не стёртый текст.
+private let phaseGap: useconds_t = 15_000
+
+/// Стирает `backspaces` символов, печатает `text`, при необходимости добивает одной
+/// клавишей (Enter) и возвращается в главный поток. Всё с ритмом и вне главного потока.
+func replaceTyped(backspaces: Int, text: String,
+                  tailKey: (code: CGKeyCode, flags: CGEventFlags)? = nil,
+                  completion: (() -> Void)? = nil) {
+    typingQueue.async {
+        for index in 0..<backspaces {
+            if index > 0 { usleep(keyGap) }
+            postMarked(keyBackspace)
+        }
+        if backspaces > 0, !text.isEmpty { usleep(phaseGap) }
+        typeText(text)
+        if let tailKey = tailKey {
+            usleep(phaseGap)
+            postMarked(tailKey.code, flags: tailKey.flags)
+        }
+        if let completion = completion { DispatchQueue.main.async(execute: completion) }
+    }
+}
+
 func postMarked(_ code: CGKeyCode, flags: CGEventFlags = []) {
     let source = CGEventSource(stateID: .hidSystemState)
     for isDown in [true, false] {
@@ -182,9 +221,11 @@ func postMarked(_ code: CGKeyCode, flags: CGEventFlags = []) {
 }
 
 /// Печатает текст напрямую в юникоде — не зависит от активной раскладки и не трогает буфер.
+/// Вызывать только с очереди печати: между символами здесь спят.
 func typeText(_ text: String) {
     let source = CGEventSource(stateID: .hidSystemState)
-    for character in text {
+    for (index, character) in text.enumerated() {
+        if index > 0 { usleep(keyGap) }
         let units = Array(String(character).utf16)
         for isDown in [true, false] {
             guard let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: isDown)
@@ -349,10 +390,8 @@ private func paste(_ text: String) {
 private func replaceSelection(with text: String) {
     expectEcho(backspaces: 1, text: text)
     buffer = ""
-    postMarked(keyBackspace)   // один backspace удаляет всё выделение целиком
-    usleep(20_000)
-    typeText(text)
-    armEchoDeadline()
+    // Один backspace удаляет всё выделение целиком.
+    replaceTyped(backspaces: 1, text: text) { armEchoDeadline() }
 }
 
 /// Решает, надо ли трогать раскладку, по выбранному правилу.
@@ -536,10 +575,7 @@ private func applyManualFix(text: String, viaSelection: Bool, layouts: [Layout],
         } else {
             setTypedBuffer(fixed)      // повторное нажатие вернёт обратно — toggle
         }
-        for _ in 0..<(text.count + tail.count) { postMarked(keyBackspace) }
-        usleep(15_000)
-        typeText(fixed + tail)
-        armEchoDeadline()
+        replaceTyped(backspaces: text.count + tail.count, text: fixed + tail) { armEchoDeadline() }
     }
     if shouldSwitchLayout(before: text, after: fixed, layouts: layouts) {
         switchInputSource(to: to)
