@@ -32,9 +32,17 @@ func setLastCompleted(_ value: (text: String, separator: Character)?) { lastComp
 /// пустое поле и стирают что попало. Правка сверяет поколение и молча отменяется, если оно
 /// сменилось. Обещание «по Enter починки нет» держится именно здесь.
 private var inputEpoch = 0
+
+/// Буфер начат не с начала слова: пока система держала тап снятым, часть букв прошла мимо нас.
+/// На экране слово целое, у нас — огрызок, и судить по нему нельзя. Самый дорогой случай —
+/// хвост сокращения: «We've» теряет голову, в буфере остаётся «'ve», в кириллице это «эму»,
+/// настоящее русское слово, и строка превращается в «Weэму».
+private var wordHeadUnknown = false
+
 private func invalidateWord() {
     buffer = ""
     lastCompleted = nil     // курсор уехал: слева от него уже не то слово
+    wordHeadUnknown = false
     inputEpoch &+= 1
 }
 
@@ -297,6 +305,10 @@ private func shortWordVerdict(word: String, fixed: String,
 func evaluate(word: String, layouts: [Layout], allowLookup: Bool = true) -> Verdict {
     guard word.count >= Settings.shared.shortWordRule.minimumLength,
           word.allSatisfy({ isWordCharacter($0, layouts: layouts) }) else { return .leave }
+    // Слово, начатое апострофом, — это хвост сокращения, а голова («we», «you», «does») уже
+    // стоит на экране и в буфер не попала. Судить по хвосту нельзя: «'ve» в кириллице читается
+    // как «эму» — настоящее русское слово, — и «We've» на глазах превращается в «Weэму».
+    guard word.first != "'", word.first != "\u{2019}" else { return .leave }
     guard let (from, to) = guessDirection(word, layouts: layouts),
           let sourceLanguage = dictionaryLanguage(for: from),
           let targetLanguage = dictionaryLanguage(for: to),
@@ -510,9 +522,16 @@ private func handleKeyDown(_ event: CGEvent) -> Bool {
     buffer = ""
     guard character.isWhitespace || character.isPunctuation || character.isSymbol
     else { return false }
+    // Слово закончилось — следующее начнётся при нас, с первой буквы.
+    let headUnknown = wordHeadUnknown
+    wordHeadUnknown = false
     // Автоматически чиним только если автомат включён; следить за словом — всё равно следим.
     guard Settings.shared.autoEnabled else { return false }
     guard !word.isEmpty else { return false }
+    guard !headUnknown else {
+        trace("авто: «\(word)» — начало слова прошло мимо снятого тапа, не трогаю")
+        return false
+    }
     let layouts = activeLayouts(from: autoLayouts)
     // Слева от курсора теперь стоит это слово с этим разделителем. Если починка сработает,
     // applyFix перепишет запись на починенный вариант — хоткею нужно то, что на экране.
@@ -552,8 +571,9 @@ private func handleKeyDown(_ event: CGEvent) -> Bool {
 /// синтетическое нажатие — лишний способ не отправить сообщение вовсе.
 private func handleReturn(code: CGKeyCode, flags: CGEventFlags) -> Bool {
     let word = buffer
+    let headUnknown = wordHeadUnknown
     invalidateWord()          // слово закрыто в любом случае
-    guard Settings.shared.autoEnabled, !word.isEmpty else { return false }
+    guard Settings.shared.autoEnabled, !word.isEmpty, !headUnknown else { return false }
     let layouts = activeLayouts(from: autoLayouts)
     // Поколение считаем уже после invalidateWord: сменится оно только если человек успел
     // щёлкнуть мышью или нажать что-то ещё, пока мы держим Enter. Тогда стирать нельзя —
@@ -627,6 +647,7 @@ private let tapCallback: CGEventTapCallBack = { _, type, event, _ in
         // и проверять его — значит гадать. Начинаем со следующего слова.
         trace("система отключила тап (\(type.rawValue)) — включаю обратно, буфер сброшен")
         invalidateWord()
+        wordHeadUnknown = true   // слово уже началось без нас; дождёмся следующего
         if let tap = activeTap { CGEvent.tapEnable(tap: tap, enable: true) }
     default:
         break
