@@ -19,6 +19,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let layouts: [Layout]
 
+    /// Включён ли сейчас защищённый ввод. Опрашиваем, а не ждём уведомления: системного
+    /// события об этом нет, а вызов дешёвый.
+    private var secureInputOn = false
+    private var secureInputWatch: Timer?
+
     init(layouts: [Layout]) {
         self.layouts = layouts
         super.init()
@@ -27,15 +32,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         // быстро кончается, и лишние пиксели утаскивают иконку под чёлку, где она
         // не видна и не нажимается.
         item.length = 24
-        if let button = item.button {
-            let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
-            button.image = NSImage(systemSymbolName: "character.cursor.ibeam",
-                                   accessibilityDescription: "switcher")?
-                .withSymbolConfiguration(config)
-            button.image?.isTemplate = true
-            if button.image == nil { button.title = "⇄" }
-            button.imagePosition = .imageOnly
-        }
+        secureInputOn = SecureInput.isOn
+        applyIcon()
 
         let menu = NSMenu()
         menu.delegate = self
@@ -45,6 +43,34 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         // Диагностика запуска: если иконки не видно, отсюда понятно, кто виноват —
         // приложение её не создало или система не нашла места в строке меню.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.writeStartupReport() }
+
+        secureInputWatch = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.checkSecureInput()
+        }
+    }
+
+    /// Иконка показывает не только присутствие, но и способность работать: при защищённом
+    /// вводе — замок. Пока он висит, молчание программы объяснено, и искать поломку не надо.
+    private func applyIcon() {
+        guard let button = item.button else { return }
+        let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+        let symbol = secureInputOn ? "lock.fill" : "character.cursor.ibeam"
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "switcher")?
+            .withSymbolConfiguration(config)
+        button.image?.isTemplate = true
+        if button.image == nil { button.title = secureInputOn ? "🔒" : "⇄" }
+        button.imagePosition = .imageOnly
+        button.toolTip = secureInputOn
+            ? "Защищённый ввод включён — клавиши до программы не доходят"
+            : nil
+    }
+
+    private func checkSecureInput() {
+        let now = SecureInput.isOn
+        guard now != secureInputOn else { return }
+        secureInputOn = now
+        applyIcon()
+        refresh()
     }
 
     private func writeStartupReport() {
@@ -83,6 +109,16 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private func rebuild(_ menu: NSMenu) {
         let settings = Settings.shared
         menu.removeAllItems()
+
+        // Пока включён защищённый ввод, до нас не доходит ни одна клавиша — ни автомат,
+        // ни хоткей не сработают. Это не наша поломка, но выглядит ровно как она.
+        if secureInputOn {
+            let holder = SecureInput.holderName()
+            menu.addItem(info("🔒 Защищённый ввод" + (holder.map { ": \($0)" } ?? "")))
+            menu.addItem(info("    клавиши до программы не доходят"))
+            menu.addItem(info("    снимается, когда уйдёт фокус с поля пароля"))
+            menu.addItem(.separator())
+        }
 
         // Без прав программа видна, но бессильна — говорим об этом первым же пунктом.
         if !inputCaptureReady {

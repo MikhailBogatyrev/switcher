@@ -3,7 +3,7 @@ set -e
 cd "$(dirname "$0")"
 
 # 1. Бинарник — для CLI-режимов (--check, --line, разовая перебивка).
-swiftc -O main.swift auto.swift phrase.swift menu.swift settings.swift log.swift autostart.swift learn.swift \
+swiftc -O main.swift auto.swift phrase.swift menu.swift secure.swift settings.swift log.swift autostart.swift learn.swift \
     -o switcher
 
 # 2. Тот же код в .app-обёртке. Без неё macOS не показывает иконку в строке меню:
