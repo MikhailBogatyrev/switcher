@@ -599,23 +599,46 @@ func activateInputCapture() -> Bool {
     return true
 }
 
-/// Не даёт запуститься второму экземпляру. Автозапуск может сработать сразу двумя путями
-/// (LaunchAgent + Login Item), и без этой проверки в строке меню появляются две иконки.
-/// Оставляем самый ранний процесс, все последующие завершаем.
-func terminateIfAlreadyRunning() {
-    guard let bundleID = Bundle.main.bundleIdentifier else { return }
-    let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
-    guard running.count > 1 else { return }
-    let oldest = running.min {
-        ($0.launchDate ?? .distantFuture) < ($1.launchDate ?? .distantFuture)
+/// Не даёт запуститься второму экземпляру.
+///
+/// Автозапуск срабатывает сразу двумя путями: LaunchAgent из ~/Library/LaunchAgents и
+/// Login Item в системных настройках. Обе копии стартуют в одну и ту же секунду, обе
+/// вешают свой перехват — и каждая чинит слово по-своему, вперемежку стирая и печатая.
+/// На экране это выглядит дико: «ПЕЬ» превращается не в «GTM», а в «GTMG TM», «свитчер» —
+/// в «свиствчиетр».
+///
+/// Спрашивать NSRunningApplication, как было раньше, бесполезно: проверка идёт до создания
+/// NSApplication, процесс ещё не зарегистрирован в оконном сервере, и при одновременном
+/// старте обе копии видят себя единственными. Поэтому берём файловый замок: flock атомарен
+/// в ядре, гонки нет, а при падении процесса система снимает его сама.
+///
+/// Дескриптор держим открытым до конца жизни процесса — закроется он, снимется и замок.
+private var instanceLock: CInt = -1
+
+func claimSingleInstance() -> Bool {
+    let path = dataDirectory().appendingPathComponent("instance.lock").path
+    let descriptor = open(path, O_CREAT | O_RDWR, 0o644)
+    guard descriptor >= 0 else { return true }   // проверить не вышло — работать не мешаем
+    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+        close(descriptor)
+        return false
     }
-    if oldest?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
-        exit(0)   // мы — лишний экземпляр
-    }
+    instanceLock = descriptor
+    ftruncate(descriptor, 0)
+    let line = "\(ProcessInfo.processInfo.processIdentifier)\n"
+    _ = line.withCString { write(descriptor, $0, strlen($0)) }
+    return true
 }
 
 func runDaemon(layouts: [Layout], auto: Bool) {
-    terminateIfAlreadyRunning()
+    guard claimSingleInstance() else {
+        let holder = (try? String(contentsOf: dataDirectory().appendingPathComponent("instance.lock"),
+                                  encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = "Switcher уже работает" + (holder.map { " (pid \($0))" } ?? "")
+            + " — второй экземпляр не нужен\n"
+        FileHandle.standardError.write(Data(message.utf8))
+        exit(0)
+    }
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
 
