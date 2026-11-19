@@ -342,6 +342,22 @@ private func copyRealSelection() -> String? {
     return text
 }
 
+/// Просит приложение включить дерево доступности.
+///
+/// Electron и Chromium (Claude, Slack, VS Code, Chrome) строят дерево доступности не всегда,
+/// а только когда об этом попросит вспомогательная программа — иначе экономят. Без просьбы
+/// система не отдаёт для них ни сфокусированный элемент, ни выделение: хоткей на выделенном
+/// тексте молчал, и снаружи это выглядело как «ничего не происходит». Просьба — один
+/// атрибут на элементе приложения; для остальных программ он неизвестен, и это безвредно.
+///
+/// Просим при каждой активации приложения, а не в момент нажатия: дерево строится не
+/// мгновенно, и к хоткею оно должно быть уже готово.
+func requestAccessibilityTree(of app: NSRunningApplication?) {
+    guard let pid = app?.processIdentifier else { return }
+    let element = AXUIElementCreateApplication(pid)
+    AXUIElementSetAttributeValue(element, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+}
+
 /// Сфокусированный UI-элемент системы.
 private func focusedElement() -> AXUIElement? {
     let system = AXUIElementCreateSystemWide()
@@ -469,7 +485,14 @@ func fixSelection(layouts allLayouts: [Layout]) {
     // 1. Настоящее выделение ЧИТАЕМ через Accessibility (надёжно даже в Electron), а заменяем
     //    синтетическими клавишами — backspace стирает выделение, печать вводит правку. AX-запись
     //    в Electron рапортует «успех», но на деле ничего не меняет, поэтому ей не доверяем.
-    if let (_, selected) = selectionViaAX() {
+    var axSelection = selectionViaAX()
+    if axSelection == nil {
+        // Дерево доступности могло быть ещё не построено — просим и даём ему мгновение.
+        requestAccessibilityTree(of: NSWorkspace.shared.frontmostApplication)
+        usleep(120_000)
+        axSelection = selectionViaAX()
+    }
+    if let (_, selected) = axSelection {
         trace("выделение (AX): «\(selected)»")
         let direction = guessDirection(selected, layouts: layouts)
             ?? directionFromCurrentLayout(layouts)
@@ -655,6 +678,15 @@ func runDaemon(layouts: [Layout], auto: Bool) {
     // Хоткей занимаем сразу: он работает без Accessibility, и если этого не сделать,
     // сочетание уйдёт в приложение и вставит символ — худшая из возможных реакций.
     registerHotkey()
+
+    // Дерево доступности у Electron-приложений включаем заранее, при каждой активации.
+    requestAccessibilityTree(of: NSWorkspace.shared.frontmostApplication)
+    NSWorkspace.shared.notificationCenter.addObserver(
+        forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+    ) { note in
+        requestAccessibilityTree(of: note.userInfo?[NSWorkspace.applicationUserInfoKey]
+                                     as? NSRunningApplication)
+    }
 
     // Иконку показываем всегда и сразу — даже без прав. Иначе выдавать права не за чем:
     // программы на экране не видно, и непонятно, запустилась ли она вообще.
