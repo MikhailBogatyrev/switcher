@@ -10,7 +10,11 @@ final class LearnedWords {
     static let shared = LearnedWords()
 
     /// язык -> слова в нижнем регистре
+    ///
+    /// Читают их из двух потоков: колбэк перехвата спрашивает на главном, догоняющая
+    /// проверка — на очереди словаря. Словарь Swift этого не прощает, поэтому замок.
     private var words: [String: Set<String>] = [:]
+    private let lock = NSLock()
     private let url: URL
 
     private init() {
@@ -23,12 +27,22 @@ final class LearnedWords {
     }
 
     func contains(_ word: String, language: String) -> Bool {
-        words[language]?.contains(word.lowercased()) ?? false
+        lock.lock()
+        defer { lock.unlock() }
+        return words[language]?.contains(word.lowercased()) ?? false
     }
 
-    var count: Int { words.values.reduce(0) { $0 + $1.count } }
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return words.values.reduce(0) { $0 + $1.count }
+    }
 
-    func list(language: String) -> [String] { (words[language] ?? []).sorted() }
+    func list(language: String) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return (words[language] ?? []).sorted()
+    }
 
     /// Есть ли в тексте хоть одно выученное слово этого языка.
     func containsAny(_ text: String, language: String) -> Bool {
@@ -39,7 +53,9 @@ final class LearnedWords {
     func learn(_ text: String, language: String) {
         var added = false
         for word in wordsIn(text) where !isRealWord(word, language: language) {
+            lock.lock()
             words[language, default: []].insert(word.lowercased())
+            lock.unlock()
             added = true
             trace("выучил «\(word)» как \(language)")
         }
@@ -50,7 +66,9 @@ final class LearnedWords {
     func forget(_ text: String, language: String) {
         var removed = false
         for word in wordsIn(text) where contains(word, language: language) {
+            lock.lock()
             words[language]?.remove(word.lowercased())
+            lock.unlock()
             removed = true
             trace("забыл «\(word)» из \(language)")
         }
@@ -58,7 +76,9 @@ final class LearnedWords {
     }
 
     func removeAll() {
+        lock.lock()
         words.removeAll()
+        lock.unlock()
         save()
     }
 
@@ -74,7 +94,9 @@ final class LearnedWords {
     }
 
     private func save() {
+        lock.lock()
         let plain = words.mapValues { Array($0).sorted() }
+        lock.unlock()
         guard let data = try? JSONEncoder().encode(plain) else { return }
         try? data.write(to: url, options: .atomic)
     }

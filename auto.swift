@@ -78,6 +78,22 @@ func dictionaryLanguage(for layout: Layout) -> String? {
 /// нормальный текст мусором, поэтому такие строки словом не считаем вовсе.
 private var spellCache: [String: Bool] = [:]
 
+/// Очередь словаря и замки к общим таблицам.
+///
+/// Догоняющая проверка когда-то ушла из колбэка на главный поток — и упёрлась в то же самое:
+/// колбэк перехвата живёт на главном цикле. Один вызов `NSSpellChecker.guesses` стоит около
+/// 5 мс, первый — десятки; пока главный поток ищет подсказки к одному слову, следующие
+/// клавиши ждут своей очереди. Задержка тапа дорастает до полусотни миллисекунд (у соседних
+/// перехватчиков — доли), система вправе его снять, и мимо проходит целый кусок фразы.
+///
+/// Поэтому словарь работает на своей очереди, а главный поток занят только печатью. Очередь
+/// последовательная: NSSpellChecker один на процесс, дёргать его из двух потоков разом
+/// незачем. Замков два, и это не перестраховка: у словаря свой, у кешей свой — колбэк читает
+/// кеш и не должен ждать, пока в словаре ищется чужое слово.
+let dictionaryQueue = DispatchQueue(label: "switcher.dictionary", qos: .userInitiated)
+private let spellLock = NSLock()
+private let cacheLock = NSLock()
+
 /// Ответ словаря, если он известен без обращения к системе: nil — «не спрашивали».
 ///
 /// Разделение не косметическое. Первый запрос про незнакомое слово читает словарь с диска и
@@ -89,6 +105,8 @@ func cachedRealWord(_ word: String, language: String) -> Bool? {
     guard !word.isEmpty, word.allSatisfy({ $0.isLetter }) else { return false }
     // Выученное у пользователя весомее словаря: это его собственное решение.
     if LearnedWords.shared.contains(word, language: language) { return true }
+    cacheLock.lock()
+    defer { cacheLock.unlock() }
     return spellCache[language + ":" + word]
 }
 
@@ -99,7 +117,9 @@ private func looksLikeAbbreviation(_ word: String) -> Bool {
 }
 
 private func spellCheck(_ word: String, language: String) -> Bool {
-    NSSpellChecker.shared.checkSpelling(
+    spellLock.lock()
+    defer { spellLock.unlock() }
+    return NSSpellChecker.shared.checkSpelling(
         of: word, startingAt: 0, language: language,
         wrap: false, inSpellDocumentWithTag: 0, wordCount: nil).location == NSNotFound
 }
@@ -114,8 +134,10 @@ func isRealWord(_ word: String, language: String) -> Bool {
     if result, looksLikeAbbreviation(word) {
         result = spellCheck(word.lowercased(), language: language)
     }
+    cacheLock.lock()
     if spellCache.count > 5000 { spellCache.removeAll() }
     spellCache[language + ":" + word] = result
+    cacheLock.unlock()
     return result
 }
 
@@ -201,8 +223,10 @@ private var looseCache: [String: Bool] = [:]
 
 private func computeNearRealWord(_ word: String, language: String) -> Bool {
     let range = NSRange(location: 0, length: (word as NSString).length)
+    spellLock.lock()
     let guesses = NSSpellChecker.shared.guesses(forWordRange: range, in: word, language: language,
                                                 inSpellDocumentWithTag: 0) ?? []
+    spellLock.unlock()
     let typed = Array(word.lowercased())
     let startsLower = word.first?.isLowercase == true
     for guess in guesses.prefix(8) {
@@ -217,11 +241,16 @@ private func nearRealWord(_ word: String, language: String, allowLookup: Bool) -
     guard word.count >= looseMinimumLength, word.allSatisfy({ $0.isLetter }),
           !looksLikeAbbreviation(word) else { return false }
     let key = language + ":" + word
-    if let known = looseCache[key] { return known }
+    cacheLock.lock()
+    let cached = looseCache[key]
+    cacheLock.unlock()
+    if let known = cached { return known }
     guard allowLookup else { return nil }
     let result = computeNearRealWord(word, language: language)
+    cacheLock.lock()
     if looseCache.count > 5000 { looseCache.removeAll() }
     looseCache[key] = result
+    cacheLock.unlock()
     return result
 }
 
@@ -596,15 +625,17 @@ private func handleReturn(code: CGKeyCode, flags: CGEventFlags) -> Bool {
         // Ответ знает только словарь. Спрашиваем вне колбэка, а Enter возвращаем в любом
         // случае — и когда починили, и когда чинить оказалось нечего. Проглотить его
         // насовсем значит съесть отправку сообщения.
-        DispatchQueue.main.async {
-            if inputEpoch == epoch,
-               case .fix(let fixed, let target) = evaluate(word: word, layouts: layouts) {
-                trace("Enter (вдогонку): слово «\(word)» -> «\(fixed)»")
-                applyFix(word: word, separator: nil, fixed: fixed, to: target,
-                         alreadyOnScreen: true, followUpKey: (code, flags))
-            } else {
-                trace("Enter (вдогонку): слово «\(word)» — оставляю как есть")
-                postMarked(code, flags: flags)
+        dictionaryQueue.async {
+            let verdict = evaluate(word: word, layouts: layouts)
+            DispatchQueue.main.async {
+                if inputEpoch == epoch, case .fix(let fixed, let target) = verdict {
+                    trace("Enter (вдогонку): слово «\(word)» -> «\(fixed)»")
+                    applyFix(word: word, separator: nil, fixed: fixed, to: target,
+                             alreadyOnScreen: true, followUpKey: (code, flags))
+                } else {
+                    trace("Enter (вдогонку): слово «\(word)» — оставляю как есть")
+                    postMarked(code, flags: flags)
+                }
             }
         }
         return true
@@ -613,18 +644,23 @@ private func handleReturn(code: CGKeyCode, flags: CGEventFlags) -> Bool {
 
 /// Догоняющая проверка: слово уже на экране вместе с разделителем, спрашиваем словарь спокойно.
 private func evaluateOffTap(word: String, separator: Character, layouts: [Layout], epoch: Int) {
-    guard case .fix(let fixed, let target) = evaluate(word: word, layouts: layouts) else {
-        trace("авто (вдогонку): слово «\(word)» — оставляю как есть")
-        return
+    dictionaryQueue.async {
+        guard case .fix(let fixed, let target) = evaluate(word: word, layouts: layouts) else {
+            trace("авто (вдогонку): слово «\(word)» — оставляю как есть")
+            return
+        }
+        DispatchQueue.main.async {
+            // Пока спрашивали словарь, человек нажал Enter, стрелку или щёлкнул мышью:
+            // стирать теперь нечего и опасно — правка отменяется.
+            guard inputEpoch == epoch else {
+                trace("авто (вдогонку): «\(word)» — ввод ушёл дальше, правку отменяю")
+                return
+            }
+            trace("авто (вдогонку): слово «\(word)» -> «\(fixed)»")
+            applyFix(word: word, separator: separator, fixed: fixed, to: target,
+                     alreadyOnScreen: true)
+        }
     }
-    // Пока спрашивали словарь, человек нажал Enter, стрелку или щёлкнул мышью: стирать
-    // теперь нечего и опасно — правка отменяется.
-    guard inputEpoch == epoch else {
-        trace("авто (вдогонку): «\(word)» — ввод ушёл дальше, правку отменяю")
-        return
-    }
-    trace("авто (вдогонку): слово «\(word)» -> «\(fixed)»")
-    applyFix(word: word, separator: separator, fixed: fixed, to: target, alreadyOnScreen: true)
 }
 
 private let tapCallback: CGEventTapCallBack = { _, type, event, _ in
@@ -704,7 +740,7 @@ func startAutoMode(layouts: [Layout]) -> Bool {
         userInfo: nil
     ) else { return false }
 
-    warmUpDictionaries(layouts)
+    dictionaryQueue.async { warmUpDictionaries(layouts) }
     trace("тап создан, раскладок: \(layouts.count), автомат: \(Settings.shared.autoEnabled)")
     activeTap = tap
     let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
