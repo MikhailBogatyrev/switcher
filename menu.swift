@@ -23,6 +23,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     /// события об этом нет, а вызов дешёвый.
     private var secureInputOn = false
     private var secureInputWatch: Timer?
+    private var secureInputSince: Date?
+    private var warnedSecureInputHolder: pid_t?
 
     init(layouts: [Layout]) {
         self.layouts = layouts
@@ -67,10 +69,26 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     private func checkSecureInput() {
         let now = SecureInput.isOn
-        guard now != secureInputOn else { return }
-        secureInputOn = now
-        applyIcon()
-        refresh()
+        if now != secureInputOn {
+            secureInputOn = now
+            applyIcon()
+            refresh()
+        }
+        guard now else {
+            secureInputSince = nil
+            warnedSecureInputHolder = nil
+            return
+        }
+        if secureInputSince == nil { secureInputSince = Date() }
+
+        // Пароль в переднем окне — нормальная жизнь, молчим. Залипший случай другой: защиту
+        // держит приложение в фоне, человек печатает не в нём, и уже не первую секунду.
+        guard let since = secureInputSince, Date().timeIntervalSince(since) >= 8,
+              let holder = SecureInput.holderApplication(),
+              holder.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier,
+              warnedSecureInputHolder != holder.processIdentifier else { return }
+        warnedSecureInputHolder = holder.processIdentifier
+        notifySecureInputStuck(holder: holder.localizedName ?? "Другое приложение")
     }
 
     private func writeStartupReport() {

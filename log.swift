@@ -132,6 +132,19 @@ private func playFixSound() {
     }
 }
 
+/// Защищённый ввод завис в фоне: его держит приложение, которого нет впереди, а человек
+/// печатает в другом — и программа для него молчит. Это не «включены ли уведомления»,
+/// а сообщение о том, что программа выключена снаружи, поэтому настройку не спрашиваем:
+/// один раз на эпизод, и только для залипшего случая — пароль в переднем окне не в счёт.
+func notifySecureInputStuck(holder: String) {
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
+    let content = UNMutableNotificationContent()
+    content.title = "Переключение не работает"
+    content.body = "\(holder) держит защищённый ввод в фоне. Щёлкните там в обычное поле или перезапустите его."
+    UNUserNotificationCenter.current().add(
+        UNNotificationRequest(identifier: "secure-input-stuck", content: content, trigger: nil))
+}
+
 /// Сообщает пользователю о починке ровно теми способами, которые он включил.
 func announce(before: String, after: String, auto: Bool) {
     ConversionLog.shared.add(before: before, after: after, auto: auto)

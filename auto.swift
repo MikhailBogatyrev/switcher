@@ -358,6 +358,20 @@ func evaluate(word: String, layouts: [Layout], allowLookup: Bool = true) -> Verd
     case .some(false): break
     }
 
+    // «done.» — это «done» и точка, а не одно слово. Точка и запятая входят в слово, потому
+    // что на русской раскладке это «ю» и «б», но словарю строку с ними не показать: со знаком
+    // он её не знает, и верный английский уезжал в кириллицу («done.» -> «вщтую») — ветка
+    // опечаток находила к «вщтую» подсказку. Поэтому отдельно спрашиваем про буквенную
+    // сердцевину: если она настоящее слово языка набора, человек писал на нём.
+    let core = String(word.drop(while: { !$0.isLetter }).reversed().drop(while: { !$0.isLetter }).reversed())
+    if core != word, !core.isEmpty {
+        switch knownWord(core, language: sourceLanguage, allowLookup: allowLookup) {
+        case .some(true): return .leave
+        case .none: return .unknown
+        case .some(false): break
+        }
+    }
+
     // Обычный случай: результат — настоящее слово другого языка.
     switch knownWord(fixed, language: targetLanguage, allowLookup: allowLookup) {
     case .some(true): return .fix(fixed, to)

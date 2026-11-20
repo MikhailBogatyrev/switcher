@@ -19,6 +19,10 @@ enum SecureInput {
     /// Кто держит защиту. Система числит её за приложением, а не за его вкладкой или
     /// процессом-помощником, поэтому имя получается человеческое: «Google Chrome».
     static func holderName() -> String? {
+        holderApplication().map { $0.localizedName ?? "процесс \($0.processIdentifier)" }
+    }
+
+    static func holderApplication() -> NSRunningApplication? {
         let root = IORegistryGetRootEntry(kIOMainPortDefault)
         guard root != 0 else { return nil }
         defer { IOObjectRelease(root) }
@@ -28,7 +32,7 @@ enum SecureInput {
               let sessions = property as? [[String: Any]] else { return nil }
         for session in sessions {
             guard let pid = session["kCGSSessionSecureInputPID"] as? pid_t, pid != 0 else { continue }
-            return NSRunningApplication(processIdentifier: pid)?.localizedName ?? "процесс \(pid)"
+            return NSRunningApplication(processIdentifier: pid)
         }
         return nil
     }
